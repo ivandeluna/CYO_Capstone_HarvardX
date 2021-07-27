@@ -1,0 +1,662 @@
+---
+title: 'Chose your own project: COVID-19 patient death rate analysis'
+author: "Iván de Luna"
+date: "26/7/2021"
+output:
+  pdf_document: default
+  word_document: default
+---
+###############################################################################
+The database used in this exercise can be downloaded from the
+Dirección General de Epidemiología Datos Abiertos website
+https://www.gob.mx/salud/documentos/datos-abiertos-152127
+We will use the july 10th 2021 database, it is recommended that if the database
+does not load succesfully, try another time given the server side load.
+###############################################################################
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# Load libraries
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(dplyr)) install.packages("dplyr", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(ggplot2)) install.packages("ggplot2", repos = "http://cran.us.r-project.org")
+if(!require(matrixStats)) install.packages("matrixStats", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", dependencies = c("Depends", "Suggests"), repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest", repos = "http://cran.us.r-project.org")
+if(!require(rpart)) install.packages("rpart", repos = "http://cran.us.r-project.org")
+if(!require(reshape2)) install.packages("reshape2", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(Hmisc)) install.packages("Hmisc", repos = "http://cran.us.r-project.org")
+if(!require(xtable)) install.packages("Hmisc", repos = "http://cran.us.r-project.org")
+
+# Load Libraries
+library(tidyverse)
+library(dplyr)
+library(data.table)
+library(lubridate)
+library(ggplot2)
+library(matrixStats)
+library(caret)
+library(randomForest)
+library(rpart)
+library(reshape2)
+library(knitr)
+library(kableExtra)
+library(Hmisc)
+library(xtable)
+
+```
+## Introduction
+
+There has been a lot of debate about the causes of death regarding COVID-19, given the prevalence of the desease and
+the array of diferent sympstons that can complicate the treatment.
+In the Mexico case, the database that has been collected oficially has changed because of the further research that
+has given more light on what can be a probable rease a patient did not survived treatment. At the begining it was
+implied that any preexisting respiratory conditions may have a certain increase in the probability of not surviving treatment but after some time, factor such as hypertension, chronic renal disease and obeisty have become the common suspects.
+
+This exercise will analyse the causes of death regarding registered conditions given the database selected and
+create a data model with the most relevant ones in trying to improve accuracy.
+
+```{r download-database, eho=FALSE, message=FALSE, warning=FALSE}
+# This will load the database in a temporary file and create the data data frame, then unlink the temp file.
+temp <- tempfile()
+download.file("http://datosabiertos.salud.gob.mx/gobmx/salud/datos_abiertos/historicos/2021/07/datos_abiertos_covid19_10.07.2021.zip", temp)
+data <- read.csv(unzip(temp, "210710COVID19MEXICO.csv"))
+unlink(temp)
+```
+
+# Metodology
+
+The database that can be downloaded from the DGE website contains a csv zipped file with all the information
+from the whole National Health Service System, including private and public hospitals and medical facilities.
+There is an additional file names "Dictionario de datos" which contains the description and possible values in the database.
+There are some considerations regarding this analysis, in which we will define the deceased conditions as having a
+defunction date as stated in the database. Also we will not emphasise in pregnancy condition, or any other condition
+that cannot be directly related to a health pre-existing or developed condition.
+
+
+# Exploratory and data analysis
+
+
+The database, which contains 7,732,694 records with 40 variables, not all of them will be useful for this analysys. For example, there is a unique identifier for every person that has been registered in a COVID-19 related case. This does not mean that the patient is positive.
+
+```{r Id Summary, echo = FALSE, warning = FALSE}
+head(data$id_registro)
+```
+
+There are also variables that specify where does the patient comes from, where is being treated or, given the
+ambulatory patients, whom did not stayed at a hospital, this may be usefull in term of analyzing infraestructure
+or health provider availability.
+
+```{r Residency Summary, echo = FALSE, warning = FALSE}
+head(data[c(3,4,6,7,8),])
+```
+
+For the date variables, there is an update record (fecha_actualizacion), a registration record (fecha_ingreso), an initial symptons record (fecha_sintomas) and a defunction record (fecha_def). Only the last variable will be useful in order to diferentiate patients that survived or died.
+
+
+
+```{r Data preparation, echo=FALSE}
+#There are some variables (FECHA_ACTUALIZACION, FECHA_INGRESO, FECHA_SINTOMSA, FECHA_DEF) which we will parse into a #POSIXt format but first for a more convenient workflow, we lowercase the variable names.
+names(data) <- tolower(names(data))
+
+
+# Initial symptoms date
+data$fecha_sintomas <- as_datetime(data$fecha_sintomas)
+# Decease date
+data$fecha_def <- as_datetime(data$fecha_def)
+
+
+```
+
+Given that the database has a lot of records, for speed and memory management purposes we will subset
+it by state, we will chose the number 5, which refers to the Coahuila state and we will subset the variables to the 
+conditions that we are interested in:
+
+1. id_registro - Unique identifier
+2. sector - the type of medical unit the patient was registered
+3. sexo - gender of the patient
+4. fecha_def - date when the patient died
+5. intubado - the patient was assigned a ventilator
+6. neumonia - Neumony diagnose
+7. edad - patient age
+8. diabetes - Diabetes condition
+9. epoc - EPOC condition
+10. asma -  Asthma condition
+11. inmusupr - Immunosuppresion condition
+12.hipertension - Hypertension condition
+13. otra_com - Other conditions
+15. cardiovascular - Cardiovascular condition
+15. obesidad - Obesity condition
+16. renal_cronica - Chronic renal condition
+17. tabaquismo - Smoker condition
+18. clasificacion_final - Final results for COVID19 test
+
+
+```{r State-db-filter, echo=FALSE}
+# For the actual objective of this analysis, we do not need all the variables that are contained
+# in the dataset, so we will keep the ones that will be useful in the case of death - conditions analysis
+# which are:
+
+vars <- c("id_registro",
+          "sector",
+          "sexo",
+          "fecha_sintomas",
+          "fecha_def",
+          "intubado",
+          "neumonia",
+          "edad",
+          "diabetes",
+          "epoc",
+          "asma",
+          "inmusupr",
+          "hipertension",
+          "otra_com",
+          "cardiovascular",
+          "obesidad",
+          "renal_cronica",
+          "tabaquismo",
+          "clasificacion_final")
+
+# For a faster analysis we will subset the data to a single state
+data1 <- data %>% filter(entidad_res == 5)
+covid <- subset(data1, select = vars)
+```
+
+There are some considerations regarding the database, in which the conditions are arranged in a factor format classified as:
+
+* 1 - the patient has the condition
+* 2 - the patient does not have the condition
+* 97 - the condition does not apply (such as pregnancy in male patients)
+* 98 - there is not enough information to determine if the condition exists
+* 99 - not specified
+
+Which will be further arranged as a binomial option of having or not having certain condition, of which the most prevalent are hypertension, diabetes and obesity.
+
+```{r condition-formatting, echo=FALSE, warning=FALSE}
+# We only have to classes, integer and datetime, as most of the variables regarding
+# a health condition are defined in the data catalog as having five options:
+# 1 - yes >> 1 if they have the condition
+# 2 - no >> 0 if they do not have the condition
+# 97 - does not apply
+# 98 - is ignored or not enough information
+# 99 - not specified
+
+# For this analysis we need to drop the 97, 98 and 99 values from the conditions:
+covid <- covid %>% filter(intubado %in% c(1,2))
+covid <- covid %>% filter(neumonia %in% c(1,2))
+covid <- covid %>% filter(diabetes %in% c(1,2))
+covid <- covid %>% filter(epoc %in% c(1,2))
+covid <- covid %>% filter(asma %in% c(1,2))
+covid <- covid %>% filter(inmusupr %in% c(1,2))
+covid <- covid %>% filter(hipertension %in% c(1,2))
+covid <- covid %>% filter(otra_com %in% c(1,2))
+covid <- covid %>% filter(cardiovascular %in% c(1,2))
+covid <- covid %>% filter(obesidad %in% c(1,2))
+covid <- covid %>% filter(renal_cronica %in% c(1,2))
+covid <- covid %>% filter(tabaquismo %in% c(1,2))
+
+
+# and then we will change all non having condition to 0
+covid$intubado[covid$intubado==2] <- 0
+covid$neumonia[covid$neumonia==2] <- 0
+covid$diabetes[covid$diabetes==2] <- 0
+covid$epoc[covid$epoc==2] <- 0
+covid$asma[covid$asma==2] <- 0
+covid$inmusupr[covid$inmusupr==2] <- 0
+covid$hipertension[covid$hipertension==2] <- 0
+covid$otra_com[covid$otra_com==2] <- 0
+covid$cardiovascular[covid$cardiovascular==2] <- 0
+covid$obesidad[covid$obesidad==2] <- 0
+covid$renal_cronica[covid$renal_cronica==2] <- 0
+covid$tabaquismo[covid$tabaquismo==2] <- 0
+
+
+covid %>%
+  summarise(diabetes = sum(diabetes),
+            epoc = sum(epoc),
+            asthma= sum(asma),
+            im = sum(inmusupr),
+            hypertension = sum(hipertension),
+            other = sum(otra_com),
+            cardio = sum(cardiovascular),
+            obesity = sum(obesidad),
+            tabaqusim = sum(tabaquismo),
+            chronic_renal = sum(renal_cronica)) %>% 
+  melt() %>% 
+  ggplot(aes(x = as.factor(variable),
+             y = value)) +
+  geom_bar(stat = "identity", aes(fill = variable)) +
+  labs(title = "Patients by condition",
+       x = "Condition",
+       y = "Count")+
+  scale_fill_discrete(name = "Condition")
+```
+
+Given gender, there are slightly more men than women in the database
+
+```{r gender-formatting, echo=FALSE, warning = FALSE}
+
+# For the gender case, the possible values are:
+# 1 - Man >> 1
+# 2 - Woman >> 0
+# 3 - Not specified
+
+#covid$sexo <- as.factor(covid$sexo)
+
+covid$sexo[covid$sexo == 2] <- 0
+
+covid %>% group_by(sexo) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = as.factor(sexo), y = n)) +
+  geom_bar(stat = "identity", aes(fill = as.factor(sexo)))+
+  labs(title = "Patients by gender",
+       x = "Gender",
+       y = "Count")+
+  scale_fill_discrete(name = "Gender", labels = c("Male", "Female"))
+
+```
+and most of the patients are adults.
+
+```{r age, echo=FALSE, warning=FALSE}
+covid %>% group_by(edad) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = as.factor(edad), y = n)) +
+  geom_bar(stat = "identity", fill = "lightblue")+
+  labs(title = "Patients by age",
+       x = "Age",
+       y = "Count")
+```
+
+Regarding the health service sector, Mexico public health system has a wide coverage wich can be
+reflected by the substantially large proportion of attendance to this sector.
+```{r service-formatting, echo=FALSE}
+# and in the sector variable we have this possibilities:
+# 1 - Red Cross
+# 2 - DIF (Local social assistance program)
+# 3 - State medical service
+# 4 - National Social Security Health Service (NHS)
+# 5 - NHS in the Bienestar program
+# 6 - State Worker Social Security Service
+# 7 - Municipal hospital
+# 8 - PEMEX (State Oil Company)
+# 9 - Private
+# 10 - Army Health Service
+# 11 - Navy Health Service
+# 12 - Health Secretariat
+# 13 - University Hospitals
+# 99 - Not specified
+
+# Given that most of them are of public character, we can reclassified them into
+# two options:
+# 1 - Public Health Service
+# 0 - Private Health Service
+# Given that only the value of 9 referse to Private health service, we do the following:
+
+# First we drop the Not specified values
+covid <- covid %>% filter(sector != 99)
+
+# Then we redefine everything that is not private as 0 and private as 1
+covid$sector[covid$sector!=9] <- 0
+covid$sector[covid$sector==9] <- 1
+
+covid %>% group_by(sector) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = as.factor(sector), y = n)) +
+  geom_bar(stat = "identity", aes(fill = as.factor(sector)))+
+  labs(title = "Patients by health sector",
+       x = "Sector",
+       y = "Count")+
+  scale_fill_discrete(name = "Sector", labels = c("Public", "Private"))
+
+```
+
+As of the positivity of COVID-19, it can be implied that most of the people that attended or requested a health
+service with covid-19 related symptoms did in fact have the virus.
+
+```{r covid-formatting, echo=FALSE, warning = FALSE}
+# In the original database there are some variables that are related to the COVID-19
+# test, but the variable clasificacion_final compiles this results into seven possible values:
+# 1 - COVID-19 positive confirmed by being in contact with another COVID-19 positive person
+# 2 - COVID-19 positive confirmed only if the patient died and was determined post-mortem
+# 3 - COVID-19 positive given laboratory results
+# 4 - COVID-19 negative result given association with positive person
+# 5 - COVID-19 can not be determined
+# 6 - COVID-19 awaiting for lab test
+# 7 - COVID-19 negative result
+
+# Which we can reclassify as:
+# 1 - COVID-19 Positive for values 1,2,3
+# 0 - COVID-19 Negative for values 4,5,7
+# 3 - Not specified for values 6
+
+# First we drop the pending results
+covid <- covid %>% filter(clasificacion_final != 6)
+
+# and then we reclassify the rest of the values 
+covid$clasificacion_final[covid$clasificacion_final == 1] <- 1
+covid$clasificacion_final[covid$clasificacion_final == 2] <- 1
+covid$clasificacion_final[covid$clasificacion_final == 3] <- 1
+covid$clasificacion_final[covid$clasificacion_final == 4] <- 0
+covid$clasificacion_final[covid$clasificacion_final == 5] <- 0
+covid$clasificacion_final[covid$clasificacion_final == 7] <- 0
+covid$clasificacion_final[covid$clasificacion_final == 6] <- 0
+
+
+```
+
+But the outcome of the treatment was mostly favorable and the proportion of survivors is substantially large
+in comparison with deceased patients.
+
+```{r def-formatting, echo=FALSE}
+# We need to define a variable which can classify the patient as
+# having died or not, this can be determinet with the fecha_def variable
+# as they register the defunction date. If the patient has not died, they assign
+# the value of 9999-99-99.
+# So we follow the same scheme as for the other variables and assing:
+# 0 - Survived
+# 1 - Died
+
+
+covid <- covid %>% mutate(status = if_else(is.na(fecha_def), 0, 1)) 
+
+covid %>% group_by(status) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = as.factor(status), y = n)) +
+  geom_bar(stat = "identity", aes(fill = as.factor(status)))+
+  labs(title = "Patients by status",
+       x = "Status",
+       y = "Count")+
+  scale_fill_discrete(name = "Status", labels = c("Live", "Deceased"))
+```
+
+
+But differentiating by COVID-19 results will give us more insight regarding the disease, such as that male patients are more probable to be infected that female patients.
+
+```{r covid-sex, echo=FALSE, warning=FALSE}
+covid %>% select(sexo, clasificacion_final) %>% 
+  group_by(sexo, clasificacion_final) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = as.factor(clasificacion_final), y = n, fill = as.factor(sexo))) +
+  geom_bar(stat = "identity") +
+  labs(title = "COVID-19 Cases by test result",
+       x = "Test results",
+       y = "Count") +
+  scale_fill_discrete(name = "Gender",
+                      labels = c("Male", "Female")) +
+  scale_x_discrete(labels = c("Negative", "Positive"))
+```
+
+
+In terms of age, most of the cases, independently from the COVID-19 test result, are from adults and centered around 60 years old, 
+```{r covid-age, echo=FALSE, warning=FALSE}
+# by age
+covid %>% select(clasificacion_final, edad) %>% 
+  group_by(edad, clasificacion_final) %>%
+  summarise(n = n()) %>% 
+  ggplot(aes(x = edad, y = n, fill = as.factor(clasificacion_final))) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "COVID-19 Cases by age and test result",
+       x = "Age",
+       y = "Count") +
+  scale_fill_discrete(name = "Test Result",labels = c("Negative", "Positive"))
+```
+
+In terms of date of symptons, we can identify three peaks around july 2020 and the last quarter of the same year.
+It seems that the infection rate has decreased considerably in the last year, while the non-positive results remained constant over the whole time frame.
+```{r covid-date, echo=FALSE, warning=FALSE}
+# by date
+covid %>% select(clasificacion_final, fecha_sintomas) %>% 
+  group_by(fecha_sintomas, clasificacion_final) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = fecha_sintomas, y = n, color = as.factor(clasificacion_final))) +
+  geom_line() +
+  labs(title = "COVID-19 test results by date of initial symptons",
+       x = "Date",
+       y = "Count") +
+  scale_color_discrete(name = "Test Result",labels = c("Negative", "Positive"))
+```
+
+Regarding the final status, there seems to by an equal proportion of lived and deceased patients given the test results.
+```{r covid-outcome, echo=FALSE, warning=FALSE}
+# Now we diferentiate by outcome
+covid %>% select(clasificacion_final, status) %>% 
+  group_by(clasificacion_final, status) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = as.factor(clasificacion_final), y = n, fill = as.factor(status))) +
+  geom_bar(stat = "identity") +
+  scale_x_discrete(labels = c("Negative", "Positive")) +
+  scale_fill_discrete(name = "Patient status", labels = c("Live", "Deceased"))+
+  labs(title = "Patient status by COVID-19 test result",
+       x = "Test Result",
+       y = "Count")
+```
+
+We can also check if there is an effect on previous conditions or the ones that may have developed by COVID-19, as mentioned before and confirming the relevant pre-existing conditions, we see that diabetes, hypertension and obesity are the most common.
+
+```{r covid-prev, echo=FALSE, warning=FALSE}
+# with previous conditions we can classify
+covid %>% group_by(status, clasificacion_final) %>% 
+  summarise(diabetes = mean(diabetes),
+            epoc = mean(epoc),
+            asthma= mean(asma),
+            im = mean(inmusupr),
+            hypertension = mean(hipertension),
+            other = mean(otra_com),
+            cardio = mean(cardiovascular),
+            obesity = mean(obesidad),
+            tabaqusim = mean(tabaquismo),
+            chronic_renal = mean(renal_cronica)) %>% 
+  melt(id.vars = c("status", "clasificacion_final")) %>% 
+  ggplot(aes(x = as.factor(variable), y = value, fill = as.factor(clasificacion_final))) +
+  geom_bar(stat = "identity") +
+  facet_grid(status ~ .)+
+  scale_fill_discrete(name = "COVID-19 test results" , labels = c("Negative", "Positive")) +
+  labs(title = "Proportion of existing conditions in patients by status",
+       x = "Condition",
+       y = "Proportion")
+```
+
+But filtering by the status of the patient, those who did not survived the disease seem to have a higher rate of the above mentioned conditions.
+```{r covid-dev, echo=FALSE, warning=FALSE}
+covid %>% group_by(status, clasificacion_final) %>% 
+  summarise(diabetes = mean(diabetes),
+            epoc = mean(epoc),
+            asthma= mean(asma),
+            im = mean(inmusupr),
+            hypertension = mean(hipertension),
+            other = mean(otra_com),
+            cardio = mean(cardiovascular),
+            obesity = mean(obesidad),
+            tabaqusim = mean(tabaquismo),
+            chronic_renal = mean(renal_cronica)) %>%
+  filter(status == 1) %>% 
+  melt(id.vars = c("status", "clasificacion_final")) %>% 
+  ggplot(aes(x = as.factor(variable), y = value, fill = as.factor(clasificacion_final))) +
+  geom_bar(stat = "identity") +
+  facet_grid(status ~ .)+
+  scale_fill_discrete(name = "COVID-19 test results" , labels = c("Negative", "Positive")) +
+  labs(title = "Proportion of existing conditions in patients who died",
+       x = "Condition",
+       y = "Proportion")
+```
+
+The same effect can be seen if we take into account the probably developed conditions such as neumonia or intubation.
+```{r covid-prop, echo=FALSE, warning=FALSE}
+covid %>% group_by(status, clasificacion_final) %>% 
+  summarise(intubated = mean(intubado),
+            neumonia = mean(neumonia)) %>% 
+  melt(id.vars = c("status", "clasificacion_final")) %>% 
+  ggplot(aes(x = as.factor(variable), y = value, fill = as.factor(clasificacion_final))) +
+  geom_bar(stat = "identity") +
+  facet_grid(status ~ .)+
+  scale_fill_discrete(name = "COVID-19 test results", labels = c("Negative", "Positive")) +
+  labs(title = "Proportion of existing or developed conditions in patients by status",
+       x= "Condition",
+       y = "Proportion")
+```
+
+Where it does not seem to be much difference in the neumonia condition between both status, but the intubation
+increases in the patients that did not survived the disease.
+```{r covid-prop-1, echo=FALSE, warning=FALSE}
+covid %>% group_by(status, clasificacion_final) %>% 
+  summarise(intubated = mean(intubado),
+            neumonia = mean(neumonia)) %>% 
+  filter(status == 1) %>% 
+  melt(id.vars = c("status", "clasificacion_final")) %>% 
+  ggplot(aes(x = as.factor(variable), y = value, fill = as.factor(clasificacion_final))) +
+  geom_bar(stat = "identity") +
+  facet_grid(status ~ .)+
+  scale_fill_discrete(name = "COVID-19 test results", labels = c("Negative", "Positive")) +
+  labs(title = "Proportion of existing or developed conditions in patients who died",
+       x= "Condition",
+       y = "Proportion")
+```
+
+# Data Modeling
+
+To create a predictive model of not surviving the disease, we will concentrate in the patients that have a positive COVID-19 test result. In such case, we will use as reference the mean deceased rate of:
+```{r data-model, echo=FALSE, warning=FALSE}
+###############################################################################
+### Data Modeling
+covid1 <- covid
+
+###############################################################################
+
+
+
+# First we split and create a subset of the data
+# Subset to only covid-19 positive cases
+covid_positive <- covid1 %>% filter(clasificacion_final == 1)
+covid_positive <- covid_positive %>% select(-c(id_registro, clasificacion_final, fecha_sintomas, fecha_def))
+
+# Split into train and test sets
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(covid_positive$status, times = 1, p = 0.5, list = FALSE)
+train_set <- covid_positive[-test_index,]
+test_set  <- covid_positive[test_index,]
+
+# Mean defunction rate
+m <- mean(train_set$status)
+m
+```
+and a Root mean square error of:
+```{r rmse_mean, echo=FALSE, warning=FALSE}
+# RMSE
+sqrt(mean((m - test_set$status)^2))
+```
+## Linear regression (Binomial)
+The linear regression model gives us the possiblity of modeling the predicted value with more
+that just the mean. We can define it as y_hat = a + b_i + b_j + .. + b_n.
+In this case, for the first model all the conditions will be used, giving us a RMSE of
+```{r model_lm, echo=FALSE, warning=FALSE}
+train_lm <- lm(status ~ ., data = train_set, family = "binomial")
+predict_lm <- predict(train_lm, test_set, type = "response")
+sqrt(mean((predict_lm - test_set$status)^2))
+```
+and confirming that only a few variables are significant and the RMSE is slightly better.
+
+```{r summary_lm1, echo=FALSE, warning=FALSE}
+xtable(summary(train_lm))
+```
+
+## Linear regression with selected predictors
+
+The second model uses only the relevant predictor as by their significance,  Which gives us a slightly better RMSE.
+```{r model_lm2, echo=FALSE, warning=FALSE}
+train_lm2 <- lm(status ~ sector + sexo + intubado + neumonia + edad + renal_cronica, data = train_set, family = "binomial")
+predict_lm2 <- predict(train_lm2, test_set, type = "response")
+
+sqrt(mean((predict_lm2-test_set$status)^2))
+```
+
+
+## Classification model
+
+The classification model allows us to think in terms of groups, given that in theory people with certain conditions have more probability of not surviving the virus, this can be a better tool for modeling. With this model we can see that the best accuracy can be achieved at a certain level (k = 9), with a value of 0.62.
+```{r model_cm, echo=FALSE, warning=FALSE}
+covid_positive_knn <- covid_positive
+covid_positive_knn$status <- as.factor(covid_positive_knn$status)
+
+# we split with the same index
+train_set2 <- covid_positive_knn[-test_index,]
+test_set2  <- covid_positive_knn[test_index,]
+
+train_knn <- train(status ~ ., method = "knn",
+                   data = train_set2)
+ggplot(train_knn)
+```
+But it is not better that the linear model by means of the RMSE if we further improve the model using only the relevant variables.
+
+```{r model_cm_train, echo=FALSE, warning=FALSE}
+# We check if we can improve accuracy with the results from the linear model
+train_knn <- train(status ~ sector + sexo + intubado + neumonia + edad + renal_cronica,
+                   method = "knn", data = train_set2)
+
+ggplot(train_knn)
+```
+
+```{r model_cm_rmse, echo=FALSE, warning=FALSE}
+predict_knn <- predict(train_knn)
+sqrt(mean((as.numeric(predict_knn)-as.numeric(test_set2$status))^2))
+```
+
+
+# Regression Trees
+This model allows us to classify the cases by cuts and have a better understanding of what is happening given the patient conditions. In this case, we have a cut at age 55.5, and then being intubated can become a probable cause of death for younger people. In the case of older people, the intubation condition is further down classfied by the sector condition, which implies that public and private service can have a significant difference in outcome.
+```{r model_rt, echo=FALSE, warning=FALSE}
+train_rt <- rpart(status ~ ., data = train_set2)
+plot(train_rt)
+text(train_rt)
+```
+
+```{r mode_rt_rmse, echo=FALSE, warning=FALSE}
+predict_rt <- predict(train_rt)
+sqrt(mean((predict_rt-as.numeric(test_set2$status))^2))
+```
+
+#Regression trees with selected conditions
+If we further train our model with just the relevant variables as of the linear model, we can see that the cuts remain the same but the RMSE is not better than any of the previous models.
+```{r model_rt2, echo=FALSE, warning=FALSE}
+train_rt2 <- rpart(status ~ sector + sexo + intubado + neumonia + edad + renal_cronica,
+                   data = train_set2)
+plot(train_rt2)
+text(train_rt2)
+```
+```{r model_rt2_rmse, echo=FALSE, warning=FALSE}
+predict_rt2 <- predict(train_rt2)
+sqrt(mean((predict_rt2-as.numeric(test_set2$status))^2))
+```
+
+# Random Forest
+Using the random forest model, we can have a better accuracy rate, at around 32.47% error margin using the relevant variables as of the linear model.
+```{r model_rf, echo=FALSE, warning=FALSE}
+rf_model <- randomForest(formula = as.formula("status ~ sector + sexo + intubado + neumonia + edad + renal_cronica"), data = train_set2, ntree = 50, importance = TRUE)
+rf_model
+```
+```{r model_rf_plot, echo=FALSE, warning=FALSE}
+plot(rf_model)
+```
+and it can also tells us the relevant variables, confirming the intubated, sector and chronic renal failure conditions as the most relevant ones.
+```{r model_rf_iv, echo=FALSE, warning=FALSE}
+importance_var <- importance(rf_model, type = 1)
+importance_var
+```
+
+# Quadratic Discriminant Analysis
+The Quadratic Discriminant Analysis or QDA can also give us insight on what are the relevant conditions, but by using the ones as specified by the linear model, we see that there is no better accuracy with the test set as other models. In other cases, this can be usefull to classify which conditions or group means can be usefull to predict the survival rate.
+```{r model_qda, echo=FALSE, warning=FALSE}
+train_qda <- train(status ~ sector + sexo + intubado + neumonia + edad + renal_cronica,
+                   method = "qda", data = train_set2)
+
+predict_qda <- predict(train_qda, test_set2)
+sqrt(mean((as.numeric(predict_qda) - as.numeric(test_set2$status))^2))
+```
+# Conclusion
+As of the relevant conditions that can be confirmed by the data analysis and predictive models there is a substantial consideration regarding what makes a patient survive or not the COVID-19 disease. This will be further down understood as more and more research is done, but given the results of this analysis, pre-existing conditions such as chronic renal failure are relevant in survival rates. Given that neumonia can or not be a pre-existing condition, COVID-19 will only make it worse, and in addition to intubation and age, in increases considerable the probability of not surviving.
+This exercise gives insight on how difficult it is to predict the outcome of a recently discovered disease or virus, and how much does it plays the preexisting conditions and the still lack of understanding that exists regarding the nature and function of the complexity of the human body.
